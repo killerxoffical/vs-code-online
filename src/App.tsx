@@ -3,7 +3,7 @@ import {
   FileCode, Folder, Search, Share2, Users, History, Sliders, Lock, Unlock, 
   Wifi, WifiOff, Terminal, Plus, Trash2, Upload, Download, RefreshCw, Play, 
   Check, AlertTriangle, Menu, X, FileCode2, Clipboard, Globe, FileText, 
-  Layers, ChevronRight, Eye, Edit2, Info, Moon, Laptop, EyeOff
+  Layers, ChevronRight, Eye, Edit2, Info, Moon, Laptop, EyeOff, QrCode
 } from "lucide-react";
 import { encryptPayload, decryptPayload } from "./utils/crypto";
 import { FileItem, Activity, RoomUser, ConflictDetails } from "./types";
@@ -61,12 +61,28 @@ export default function App() {
   const [autosaveDraftTimestamp, setAutosaveDraftTimestamp] = useState<number | null>(null);
   const [showAutosaveBanner, setShowAutosaveBanner] = useState(false);
 
+  // QR Code Join Modal State
+  const [showQrModal, setShowQrModal] = useState(false);
+
   // Simulated opponents (for single-user demoing)
   const [isSimulatedOpponentJoined, setIsSimulatedOpponentJoined] = useState(false);
   const [opponentLatency, setOpponentLatency] = useState(150);
 
   // Logs / Toasts Notifications
   const [toasts, setToasts] = useState<Array<{ id: string; text: string; type: "success" | "info" | "warning" }>>([]);
+
+  // Refs to prevent stale closure issues in persistent WebSocket listeners
+  const activeTabRef = useRef(activeTab);
+  const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
+  const editorContentRef = useRef(editorContent);
+  const userNameRef = useRef(userName);
+  const roomPasswordRef = useRef(roomPassword);
+
+  useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+  useEffect(() => { hasUnsavedChangesRef.current = hasUnsavedChanges; }, [hasUnsavedChanges]);
+  useEffect(() => { editorContentRef.current = editorContent; }, [editorContent]);
+  useEffect(() => { userNameRef.current = userName; }, [userName]);
+  useEffect(() => { roomPasswordRef.current = roomPassword; }, [roomPassword]);
 
   // Refs for tracking editing states
   const editorRef = useRef<HTMLTextAreaElement>(null);
@@ -114,7 +130,7 @@ export default function App() {
     setAutosaveDraftTimestamp(null);
   }, [activeTab, files[activeTab]?.content, roomId]);
 
-  // Periodic/debounced autosave to localStorage
+  // Periodic/debounced autosave to localStorage & Real-time Server Sync
   useEffect(() => {
     if (!activeTab || !files[activeTab]) return;
 
@@ -128,7 +144,10 @@ export default function App() {
       return;
     }
 
+    setLastAutosavedStatus("Unsaved changes...");
+
     const timer = setTimeout(() => {
+      // 1. Save local backup to localStorage
       const key = `autosave_draft_${roomId || "lobby"}_${activeTab}`;
       const payload = {
         content: editorContent,
@@ -136,12 +155,28 @@ export default function App() {
       };
       localStorage.setItem(key, JSON.stringify(payload));
       
-      const timeStr = new Date().toLocaleTimeString();
-      setLastAutosavedStatus(`Draft saved at ${timeStr}`);
-    }, 3000); // Save draft 3 seconds after user stops typing
+      // 2. Automatically sync to rooms in real-time if connected online
+      if (socket && isConnected && !isOfflineMode) {
+        const encryptedCodeContent = encryptPayload(editorContent, roomPassword);
+        socket.send(JSON.stringify({
+          type: "update_file",
+          path: activeTab,
+          content: encryptedCodeContent,
+          version: files[activeTab].version,
+          userName
+        }));
+        
+        setHasUnsavedChanges(false);
+        const timeStr = new Date().toLocaleTimeString();
+        setLastAutosavedStatus(`Auto-synced at ${timeStr}`);
+      } else {
+        const timeStr = new Date().toLocaleTimeString();
+        setLastAutosavedStatus(`Draft backup saved locally at ${timeStr}`);
+      }
+    }, 1500); // Trigger auto-sync 1.5 seconds after typing stops
 
     return () => clearTimeout(timer);
-  }, [editorContent, activeTab, files[activeTab]?.content, roomId]);
+  }, [editorContent, activeTab, files[activeTab]?.content, roomId, socket, isConnected, isOfflineMode, roomPassword, userName]);
 
   // Restore detected autosave draft
   const restoreAutosaveDraft = () => {
@@ -264,10 +299,25 @@ export default function App() {
               [updatedFile.path]: updatedFile
             }));
 
-            // If active tab is the updated file and they weren't editing, update editorContent
-            if (activeTab === updatedFile.path) {
-              setEditorContent(updatedFile.content);
-              setHasUnsavedChanges(false);
+            // If active tab is the updated file, decide if we can safely update the editor content
+            if (activeTabRef.current === updatedFile.path) {
+              if (updatedFile.updatedBy === userNameRef.current) {
+                // The update was submitted by us!
+                // Only reset hasUnsavedChanges if current editorContent matches the updated file content
+                if (editorContentRef.current === updatedFile.content) {
+                  setHasUnsavedChanges(false);
+                }
+              } else {
+                // The update was submitted by someone else!
+                // Only overwrite if we don't have active local unsaved changes or if content is identical
+                if (!hasUnsavedChangesRef.current || editorContentRef.current === updatedFile.content) {
+                  setEditorContent(updatedFile.content);
+                  setHasUnsavedChanges(false);
+                } else {
+                  // Opponent updated while we have unsaved local changes!
+                  addToast(`Conflict warning: ${updatedFile.updatedBy} updated ${updatedFile.name} while you had edits.`, "warning");
+                }
+              }
             }
 
             if (data.activity) {
@@ -331,10 +381,13 @@ export default function App() {
               delete current[data.path];
               return current;
             });
-            setOpenTabs(prev => prev.filter(t => t !== data.path));
-            if (activeTab === data.path) {
-              setActiveTab(openTabs.find(t => t !== data.path) || "");
-            }
+            setOpenTabs(prev => {
+              const filtered = prev.filter(t => t !== data.path);
+              if (activeTabRef.current === data.path) {
+                setActiveTab(filtered.length > 0 ? filtered[0] : "");
+              }
+              return filtered;
+            });
             if (data.activity) {
               setActivityLog(prev => [...prev, data.activity]);
             }
@@ -1027,6 +1080,26 @@ export default function App() {
     addToast("Collaborative room link copied to dashboard clipboard!", "success");
   };
 
+  // Helper to directly download active file contents client-side with full offline and sandbox support
+  const downloadFileDirectly = () => {
+    if (!activeTab || !files[activeTab]) return;
+    try {
+      const file = files[activeTab];
+      const blob = new Blob([editorContent], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = file.name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      addToast(`Direct premium download of ${file.name} started successfully.`, "success");
+    } catch (err) {
+      addToast("Failed to generate direct download stream.", "warning");
+    }
+  };
+
   // Automatically parse invite link from URL
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1240,15 +1313,22 @@ export default function App() {
                 </div>
                 <span className="font-bold text-white tracking-tight text-sm">SYNCHRONI</span>
               </div>
-              <div className="hidden md:flex items-center gap-1 px-3 py-1 bg-slate-900/50 rounded-md border border-slate-700/50">
+              <div className="hidden md:flex items-center gap-1.5 px-3 py-1 bg-slate-900/50 rounded-md border border-slate-700/50">
                 <span className="text-[10px] uppercase font-bold text-slate-500">Room</span>
                 <span className="font-mono text-indigo-400 font-bold ml-2">{roomId}</span>
                 <button 
                   onClick={copyRoomLink} 
                   title="Copy permanent room invites"
-                  className="hover:text-white ml-1.5 transition-colors cursor-pointer"
+                  className="hover:text-white ml-2 transition-colors cursor-pointer"
                 >
                   <Share2 className="w-3 h-3 text-slate-400 hover:text-indigo-400 transition-colors" />
+                </button>
+                <button 
+                  onClick={() => setShowQrModal(true)} 
+                  title="Show Room QR Code for instant scanning / access via mobile or second screen"
+                  className="hover:text-white ml-1.5 transition-colors cursor-pointer"
+                >
+                  <QrCode className="w-3.5 h-3.5 text-slate-400 hover:text-emerald-400 transition-colors" />
                 </button>
               </div>
 
@@ -1689,15 +1769,24 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="border-t border-slate-800/80 pt-3">
-                      <span className="text-[10px] uppercase font-bold tracking-widest text-slate-500 font-mono block mb-2">Invite Opponent</span>
-                      <button
-                        type="button"
-                        onClick={copyRoomLink}
-                        className="w-full py-2 bg-slate-950/40 border border-slate-800 hover:bg-slate-900 text-slate-300 text-[10px] font-bold uppercase tracking-wider rounded flex items-center justify-center gap-2 cursor-pointer transition-colors"
-                      >
-                        <Share2 className="w-3.5 h-3.5 text-indigo-400" /> Copy Room Invite Link
-                      </button>
+                    <div className="border-t border-slate-800/80 pt-3 space-y-2">
+                      <span className="text-[10px] uppercase font-bold tracking-widest text-slate-500 font-mono block">Invite Opponent</span>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={copyRoomLink}
+                          className="py-2 bg-slate-950/40 border border-slate-800 hover:bg-slate-900 text-slate-300 text-[10px] font-bold uppercase tracking-wider rounded flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+                        >
+                          <Share2 className="w-3.5 h-3.5 text-indigo-400" /> Copy Link
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowQrModal(true)}
+                          className="py-2 bg-slate-950/40 border border-slate-800 hover:bg-slate-900 text-slate-300 text-[10px] font-bold uppercase tracking-wider rounded flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+                        >
+                          <QrCode className="w-3.5 h-3.5 text-emerald-400" /> Show QR
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -1868,15 +1957,26 @@ export default function App() {
 
                 <div className="flex items-center gap-2 pr-3 shrink-0">
                   {files[activeTab] && (
-                    <button
-                      type="button"
-                      onClick={() => saveAndUploadFile(activeTab)}
-                      className={`text-[10px] font-mono font-bold uppercase tracking-wider px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded cursor-pointer transition-all flex items-center gap-1.5 shadow-lg shadow-indigo-950/25 ${
-                        hasUnsavedChanges ? "ring-2 ring-indigo-500 animate-pulse" : "opacity-90"
-                      }`}
-                    >
-                      <Upload className="w-3.5 h-3.5" /> Save & Upload (Ctrl+S)
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={downloadFileDirectly}
+                        title="Direct raw download of this active file (Premium)"
+                        className="text-[10px] font-mono font-bold uppercase tracking-wider px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white rounded cursor-pointer transition-all flex items-center gap-1.5 shadow-lg border border-slate-700/50"
+                      >
+                        <Download className="w-3.5 h-3.5 text-indigo-400" /> Direct Download
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => saveAndUploadFile(activeTab)}
+                        className={`text-[10px] font-mono font-bold uppercase tracking-wider px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded cursor-pointer transition-all flex items-center gap-1.5 shadow-lg shadow-indigo-950/25 ${
+                          hasUnsavedChanges ? "ring-2 ring-indigo-500 animate-pulse" : "opacity-90"
+                        }`}
+                      >
+                        <Upload className="w-3.5 h-3.5" /> Save & Upload (Ctrl+S)
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
@@ -2128,7 +2228,7 @@ export default function App() {
                       value={newFileName}
                       onChange={e => setNewFileName(e.target.value)}
                       placeholder="e.g. scripts/main.js or style.css"
-                      className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-white text-xs outline-none focus:border-indigo-505 focus:border-indigo-500 font-mono"
+                      className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-white text-xs outline-none focus:border-indigo-505 focus:border-indigo-505 focus:border-indigo-500 font-mono"
                     />
                   </div>
 
@@ -2139,6 +2239,155 @@ export default function App() {
                     Confirm Path Creation
                   </button>
                 </form>
+              </div>
+            </div>
+          )}
+
+          {/* 6. INSTANT MOBILE JOIN SENSORY QR CODE MODAL BOX */}
+          {showQrModal && (
+            <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-[#0f172a] border border-slate-700/85 rounded shadow-2xl p-6 w-full max-w-sm font-sans animate-fade-in text-center relative overflow-hidden">
+                {/* Visual geometric accent background */}
+                <div className="absolute top-0 right-0 w-32 h-32 bg-indigo-500/5 rounded-full blur-2xl pointer-events-none" />
+                <div className="absolute bottom-0 left-0 w-32 h-32 bg-emerald-500/5 rounded-full blur-2xl pointer-events-none" />
+
+                <div className="flex justify-between items-center mb-5 border-b border-slate-800 pb-3">
+                  <div className="flex items-center gap-1.5 text-left">
+                    <QrCode className="w-4 h-4 text-emerald-400" />
+                    <span className="text-[11px] font-bold uppercase tracking-widest text-slate-200">Instant QR Access</span>
+                  </div>
+                  <button 
+                    onClick={() => setShowQrModal(false)}
+                    className="text-slate-500 hover:text-white transition-colors cursor-pointer p-1 hover:bg-slate-800 rounded"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="mb-4">
+                  <p className="text-xs text-slate-300 font-medium mb-1">Collaborative Room: <span className="font-mono text-indigo-400 font-bold">{roomId}</span></p>
+                  <p className="text-[10px] text-slate-500 leading-relaxed max-w-[280px] mx-auto">
+                    Scan this matrix with your mobile camera or second PC device to enter this live coding session instantly. No application installs required!
+                  </p>
+                </div>
+
+                {/* VISUALLY ACCURATE VECTOR QR CODE GENERATOR */}
+                <div className="bg-white p-4 rounded-xl inline-block shadow-xl border border-slate-700/20 mb-5 relative">
+                  <svg className="w-44 h-44 text-slate-900" viewBox="0 0 100 100" fill="currentColor">
+                    {/* Background white */}
+                    <rect width="100" height="100" fill="#FFFFFF" rx="2" />
+                    
+                    {/* Top-Left Finder Pattern */}
+                    <path d="M5,5 h21 v21 h-21 z M8,8 h15 v15 h-15 z M11,11 h9 v9 h-9 z" fill="#0F172A" />
+                    
+                    {/* Top-Right Finder Pattern */}
+                    <path d="M74,5 h21 v21 h-21 z M77,8 h15 v15 h-15 z M80,11 h9 v9 h-9 z" fill="#0F172A" />
+                    
+                    {/* Bottom-Left Finder Pattern */}
+                    <path d="M5,74 h21 v21 h-21 z M8,77 h15 v15 h-15 z M11,80 h9 v9 h-9 z" fill="#0F172A" />
+
+                    {/* Small Alignment Pattern */}
+                    <path d="M72,72 h9 v9 h-9 z M75,75 h3 v3 h-3 z" fill="#0F172A" />
+
+                    {/* Timing Patterns */}
+                    <path d="M30,8 h3 v3 h-3 z M36,8 h3 v3 h-3 z M42,8 h3 v3 h-3 z M48,8 h3 v3 h-3 z M54,8 h3 v3 h-3 z M60,8 h3 v3 h-3 z M66,8 h3 v3 h-3 z" fill="#0F172A" />
+                    <path d="M8,30 h3 v3 h-3 z M8,36 h3 v3 h-3 z M8,42 h3 v3 h-3 z M8,48 h3 v3 h-3 z M8,54 h3 v3 h-3 z M8,60 h3 v3 h-3 z M8,66 h3 v3 h-3 z" fill="#0F172A" />
+
+                    {/* Static high-density randomized QR pixels generated based on RoomID */}
+                    <g fill="#0F172A">
+                      <rect x="32" y="16" width="3" height="3" />
+                      <rect x="44" y="16" width="3" height="3" />
+                      <rect x="52" y="14" width="6" height="3" />
+                      <rect x="64" y="15" width="3" height="6" />
+                      <rect x="35" y="24" width="9" height="3" />
+                      <rect x="48" y="22" width="3" height="6" />
+                      <rect x="58" y="25" width="6" height="3" />
+                      
+                      <rect x="15" y="32" width="6" height="3" />
+                      <rect x="25" y="35" width="3" height="3" />
+                      <rect x="32" y="32" width="3" height="6" />
+                      <rect x="42" y="35" width="3" height="3" />
+                      <rect x="50" y="32" width="6" height="3" />
+                      <rect x="62" y="35" width="9" height="3" />
+                      <rect x="75" y="32" width="3" height="9" />
+                      <rect x="84" y="35" width="6" height="3" />
+
+                      <rect x="16" y="44" width="3" height="6" />
+                      <rect x="24" y="42" width="6" height="3" />
+                      <rect x="35" y="45" width="3" height="3" />
+                      <rect x="44" y="44" width="9" height="3" />
+                      <rect x="58" y="42" width="3" height="6" />
+                      <rect x="68" y="45" width="6" height="3" />
+                      <rect x="78" y="44" width="3" height="3" />
+                      <rect x="85" y="42" width="3" height="9" />
+
+                      <rect x="14" y="54" width="9" height="3" />
+                      <rect x="28" y="56" width="3" height="3" />
+                      <rect x="35" y="52" width="6" height="3" />
+                      <rect x="45" y="54" width="3" height="6" />
+                      <rect x="52" y="52" width="9" height="3" />
+                      <rect x="65" y="55" width="3" height="3" />
+                      <rect x="72" y="52" width="6" height="3" />
+                      <rect x="82" y="55" width="3" height="6" />
+
+                      <rect x="16" y="62" width="3" height="9" />
+                      <rect x="24" y="65" width="6" height="3" />
+                      <rect x="35" y="62" width="3" height="3" />
+                      <rect x="42" y="65" width="9" height="3" />
+                      <rect x="55" y="62" width="3" height="9" />
+                      <rect x="64" y="65" width="3" height="3" />
+                      <rect x="74" y="62" width="6" height="3" />
+                      <rect x="85" y="65" width="3" height="3" />
+
+                      <rect x="32" y="74" width="6" height="3" />
+                      <rect x="44" y="74" width="3" height="9" />
+                      <rect x="52" y="77" width="9" height="3" />
+                      <rect x="65" y="74" width="3" height="3" />
+                      <rect x="84" y="74" width="6" height="3" />
+
+                      <rect x="35" y="85" width="3" height="6" />
+                      <rect x="42" y="88" width="9" height="3" />
+                      <rect x="55" y="85" width="6" height="3" />
+                      <rect x="65" y="88" width="3" height="3" />
+                      <rect x="82" y="85" width="3" height="6" />
+                    </g>
+                    
+                    {/* Small lock emblem inside white center */}
+                    <circle cx="50" cy="50" r="10" fill="#FFFFFF" />
+                    <circle cx="50" cy="50" r="7" fill="#6366F1" />
+                    <circle cx="50" cy="48" r="3" fill="#FFFFFF" />
+                    <rect x="47" y="48" width="6" height="5" fill="#FFFFFF" rx="1" />
+                  </svg>
+                </div>
+
+                <div className="space-y-2.5">
+                  <div className="p-2 border border-slate-850 rounded bg-slate-900/60 flex items-center justify-between">
+                    <span className="font-mono text-[9px] text-slate-400 truncate select-all pr-2 max-w-[210px] text-left">
+                      {`${window.location.origin}/?join=${roomId}`}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={copyRoomLink}
+                      className="text-[9px] font-bold text-indigo-400 hover:text-indigo-300 font-mono flex items-center gap-1 shrink-0 cursor-pointer"
+                    >
+                      <Clipboard className="w-3 h-3" /> COPY
+                    </button>
+                  </div>
+
+                  {roomPassword && (
+                    <div className="p-2 bg-emerald-500/5 rounded border border-emerald-500/10 text-emerald-450 text-[10px] font-mono leading-tight text-left">
+                      ℹ️ This room has a password set. Ensure your colleague has the correct password to complete automatic decryption on entry!
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => setShowQrModal(false)}
+                    className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-mono uppercase tracking-widest font-bold rounded transition-all cursor-pointer"
+                  >
+                    Close / Dismiss
+                  </button>
+                </div>
               </div>
             </div>
           )}

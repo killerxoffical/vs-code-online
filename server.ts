@@ -419,12 +419,12 @@ async function startServer() {
             };
             room.activityLog.push(activity);
 
-            // Broadcast the file change to all clients
+            // Broadcast the file change to all clients (including the sender to update their local version number metadata)
             broadcastToRoom(currentRoomId, {
               type: "file_update",
               file,
               activity
-            }, currentUserId);
+            });
             break;
           }
 
