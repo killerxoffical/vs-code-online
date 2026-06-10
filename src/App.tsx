@@ -55,6 +55,12 @@ export default function App() {
   // Conflict Resolution States
   const [conflict, setConflict] = useState<ConflictDetails | null>(null);
 
+  // Autosave and Draft states
+  const [lastAutosavedStatus, setLastAutosavedStatus] = useState("Sync clean");
+  const [autosaveContent, setAutosaveContent] = useState<string | null>(null);
+  const [autosaveDraftTimestamp, setAutosaveDraftTimestamp] = useState<number | null>(null);
+  const [showAutosaveBanner, setShowAutosaveBanner] = useState(false);
+
   // Simulated opponents (for single-user demoing)
   const [isSimulatedOpponentJoined, setIsSimulatedOpponentJoined] = useState(false);
   const [opponentLatency, setOpponentLatency] = useState(150);
@@ -82,6 +88,82 @@ export default function App() {
       setHasUnsavedChanges(false);
     }
   }, [activeTab, files]);
+
+  // Check for autosaved draft when active tab, files, or roomId changes
+  useEffect(() => {
+    if (activeTab && files[activeTab]) {
+      const key = `autosave_draft_${roomId || "lobby"}_${activeTab}`;
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          if (parsed && typeof parsed.content === "string" && parsed.content !== files[activeTab].content) {
+            setAutosaveContent(parsed.content);
+            setAutosaveDraftTimestamp(parsed.timestamp || Date.now());
+            setShowAutosaveBanner(true);
+            return;
+          }
+        } catch (e) {
+          console.error("Failed to parse autosave draft", e);
+        }
+      }
+    }
+    // If no draft exists or it is identical to saved file content, hide the banner
+    setShowAutosaveBanner(false);
+    setAutosaveContent(null);
+    setAutosaveDraftTimestamp(null);
+  }, [activeTab, files[activeTab]?.content, roomId]);
+
+  // Periodic/debounced autosave to localStorage
+  useEffect(() => {
+    if (!activeTab || !files[activeTab]) return;
+
+    // Only set autosave if there are actual unsaved differences
+    const fileSavedContent = files[activeTab].content;
+    if (editorContent === fileSavedContent) {
+      // If content is clean, we can clear the draft to save space
+      const key = `autosave_draft_${roomId || "lobby"}_${activeTab}`;
+      localStorage.removeItem(key);
+      setLastAutosavedStatus("Sync clean");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      const key = `autosave_draft_${roomId || "lobby"}_${activeTab}`;
+      const payload = {
+        content: editorContent,
+        timestamp: Date.now()
+      };
+      localStorage.setItem(key, JSON.stringify(payload));
+      
+      const timeStr = new Date().toLocaleTimeString();
+      setLastAutosavedStatus(`Draft saved at ${timeStr}`);
+    }, 3000); // Save draft 3 seconds after user stops typing
+
+    return () => clearTimeout(timer);
+  }, [editorContent, activeTab, files[activeTab]?.content, roomId]);
+
+  // Restore detected autosave draft
+  const restoreAutosaveDraft = () => {
+    if (autosaveContent !== null) {
+      setEditorContent(autosaveContent);
+      setHasUnsavedChanges(true);
+      setShowAutosaveBanner(false);
+      addToast("Successfully restored autosaved draft buffer.", "success");
+    }
+  };
+
+  // Discard/Dismiss the detected autosave draft
+  const discardAutosaveDraft = () => {
+    if (activeTab) {
+      const key = `autosave_draft_${roomId || "lobby"}_${activeTab}`;
+      localStorage.removeItem(key);
+      setShowAutosaveBanner(false);
+      setAutosaveContent(null);
+      setAutosaveDraftTimestamp(null);
+      addToast("Autosaved draft buffer discarded.", "info");
+    }
+  };
 
   // Derive WebSocket Host path dynamically
   useEffect(() => {
@@ -372,6 +454,14 @@ export default function App() {
     const finalContent = customContent !== undefined ? customContent : editorContent;
     const file = files[filePath];
     if (!file) return;
+
+    // Clear autosave draft on manual save trigger
+    const draftKey = `autosave_draft_${roomId || "lobby"}_${filePath}`;
+    localStorage.removeItem(draftKey);
+    setLastAutosavedStatus("Sync clean");
+    setAutosaveContent(null);
+    setAutosaveDraftTimestamp(null);
+    setShowAutosaveBanner(false);
 
     if (isOfflineMode) {
       setOfflineChanges(prev => ({
@@ -1815,6 +1905,34 @@ export default function App() {
                       </div>
                     )}
 
+                    {/* Autosave Draft Banner */}
+                    {showAutosaveBanner && autosaveContent && (
+                      <div className="bg-indigo-950/60 border-b border-indigo-500/20 text-indigo-200 px-4 py-2.5 flex items-center justify-between text-xs font-mono shrink-0 animate-fade-in select-none">
+                        <span className="flex items-center gap-2 truncate">
+                          <History className="w-4 h-4 text-indigo-400 shrink-0 animate-pulse" />
+                          <span className="truncate">
+                            Autosaved draft detected ({autosaveDraftTimestamp ? new Date(autosaveDraftTimestamp).toLocaleTimeString() : ""}) with unsaved changes.
+                          </span>
+                        </span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={restoreAutosaveDraft}
+                            className="bg-indigo-600 hover:bg-indigo-550 text-white font-bold uppercase text-[9px] tracking-wider px-2 py-1 rounded cursor-pointer transition-colors"
+                          >
+                            Restore Draft
+                          </button>
+                          <button
+                            type="button"
+                            onClick={discardAutosaveDraft}
+                            className="bg-slate-800 hover:bg-slate-705 text-slate-300 font-bold uppercase text-[9px] tracking-wider px-2 py-1 rounded cursor-pointer transition-colors border border-slate-700/50"
+                          >
+                            Discard
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="flex-1 relative flex min-h-0 animate-fade-in">
                       
                       {/* Left Line Numbers decoration */}
@@ -1861,6 +1979,10 @@ export default function App() {
                         <span className="text-indigo-400 font-bold uppercase tracking-widest">{files[activeTab].language}</span>
                         <span>Lines: {editorContent.split("\n").length}</span>
                         <span>Size: {new Blob([editorContent]).size} bytes</span>
+                        <span className="text-[10px] text-slate-600 border-l border-slate-800/80 pl-4 flex items-center gap-1.5 select-none">
+                          <span className={`w-1.5 h-1.5 rounded-full transition-all duration-300 ${lastAutosavedStatus.startsWith("Draft saved") ? "bg-indigo-400 animate-pulse animate-duration-1000" : "bg-emerald-500"}`} />
+                          {lastAutosavedStatus || "Sync clean"}
+                        </span>
                       </div>
 
                       <div className="flex items-center gap-3">
