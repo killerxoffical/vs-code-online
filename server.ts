@@ -71,19 +71,74 @@ function generateRoomId(): string {
 function detectLanguage(fileName: string): string {
   const ext = fileName.split(".").pop()?.toLowerCase();
   switch (ext) {
-    case "html": return "html";
-    case "css": return "css";
+    case "html":
+    case "htm":
+    case "svg":
+    case "xml":
+      return "html";
+    case "css":
+    case "scss":
+    case "sass":
+    case "less":
+      return "css";
     case "js":
-    case "jsx": return "javascript";
+    case "jsx":
+    case "mjs":
+    case "cjs":
+      return "javascript";
     case "ts":
-    case "tsx": return "typescript";
-    case "json": return "json";
-    case "md": return "markdown";
-    case "py": return "python";
-    case "java": return "java";
+    case "tsx":
+    case "mts":
+    case "cts":
+      return "typescript";
+    case "json":
+    case "babelrc":
+    case "eslintrc":
+      return "json";
+    case "md":
+    case "markdown":
+    case "mdx":
+      return "markdown";
+    case "py":
+    case "ipynb":
+    case "pyw":
+      return "python";
+    case "java":
+    case "jar":
+      return "java";
     case "cpp":
-    case "c": return "cpp";
-    default: return "plaintext";
+    case "cxx":
+    case "cc":
+    case "hpp":
+    case "h":
+    case "c":
+      return "cpp";
+    case "rs":
+      return "rust";
+    case "go":
+      return "go";
+    case "sh":
+    case "bash":
+    case "zsh":
+      return "bash";
+    case "sql":
+      return "sql";
+    case "yaml":
+    case "yml":
+      return "yaml";
+    case "rb":
+      return "ruby";
+    case "php":
+      return "php";
+    case "swift":
+      return "swift";
+    case "kt":
+    case "kts":
+      return "kotlin";
+    case "cs":
+      return "csharp";
+    default:
+      return "plaintext";
   }
 }
 
@@ -578,6 +633,109 @@ async function startServer() {
             broadcastToRoom(currentRoomId, {
               type: "file_delete",
               path: filePath,
+              activity
+            });
+            break;
+          }
+
+          case "rename_file": {
+            if (!currentRoomId || !currentUserId) return;
+            const { oldPath, newPath, userName, activeContent } = data;
+            const room = rooms[currentRoomId];
+            if (!room) return;
+
+            const file = room.files[oldPath];
+            if (!file) {
+              ws.send(JSON.stringify({ type: "error", message: `Source file '${oldPath}' not found.` }));
+              return;
+            }
+
+            if (room.files[newPath]) {
+              ws.send(JSON.stringify({ type: "error", message: `A file at destination path '${newPath}' already exists.` }));
+              return;
+            }
+
+            // Resolve potential unsaved local edits
+            const resolvedContent = activeContent !== undefined ? activeContent : file.content;
+            const oldName = file.name;
+            const newName = newPath.split(/[/\\]/).pop() || newPath;
+
+            // Multi-file safety check: safely update all references to oldPath / oldName in the workspace
+            Object.entries(room.files).forEach(([pathKey, fItem]) => {
+              if (pathKey !== oldPath) {
+                let updatedContent = fItem.content;
+                let madeChange = false;
+
+                if (updatedContent.includes(oldPath)) {
+                  updatedContent = updatedContent.split(oldPath).join(newPath);
+                  madeChange = true;
+                }
+                if (updatedContent.includes(oldName)) {
+                  updatedContent = updatedContent.split(oldName).join(newName);
+                  madeChange = true;
+                }
+
+                if (madeChange) {
+                  fItem.content = updatedContent;
+                  fItem.version += 1;
+                  fItem.updatedAt = Date.now();
+                  fItem.updatedBy = userName;
+                  fItem.history.push({
+                    version: fItem.version,
+                    content: updatedContent,
+                    updatedAt: fItem.updatedAt,
+                    updatedBy: userName
+                  });
+                  
+                  broadcastToRoom(currentRoomId!, {
+                    type: "file_update",
+                    file: fItem
+                  });
+                }
+              }
+            });
+
+            const nextVersion = file.version + 1;
+            const renamedFile: FileItem = {
+              ...file,
+              id: newPath,
+              path: newPath,
+              name: newName,
+              content: resolvedContent,
+              language: detectLanguage(newName),
+              version: nextVersion,
+              updatedAt: Date.now(),
+              updatedBy: userName,
+              history: [
+                ...file.history,
+                {
+                  version: nextVersion,
+                  content: resolvedContent,
+                  updatedAt: Date.now(),
+                  updatedBy: userName
+                }
+              ]
+            };
+
+            delete room.files[oldPath];
+            room.files[newPath] = renamedFile;
+
+            const activity: Activity = {
+              id: Math.random().toString(36).substring(2, 9),
+              timestamp: Date.now(),
+              userId: currentUserId,
+              userName,
+              type: "edit",
+              fileName: newName,
+              details: `Renamed file from '${oldPath}' to '${newPath}' and updated workspace references.`
+            };
+            room.activityLog.push(activity);
+
+            broadcastToRoom(currentRoomId, {
+              type: "file_rename",
+              oldPath,
+              newPath,
+              file: renamedFile,
               activity
             });
             break;
